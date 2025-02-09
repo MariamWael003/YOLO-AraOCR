@@ -4,6 +4,8 @@ from glob import glob
 import random
 import shutil
 import sys
+from glob import glob
+from PIL import Image
 
 dataset_root = "/home/mariam/ML-Tech-Task/book_dataset"
 labels_dir = os.path.join(dataset_root, "labels")
@@ -12,13 +14,96 @@ classes_file = os.path.join(dataset_root, "classes.txt")
 json_folder = "/home/mariam/ML-Tech-Task/book_dataset/ann"
 os.makedirs(labels_dir, exist_ok=True)
 
+# Verify image integrity and attempt to restore corrupted files
+def verify_and_restore_images(directory):
+    for img_path in glob(os.path.join(directory, "*.jpg")) + glob(os.path.join(directory, "*.png")) + glob(os.path.join(directory, "*.jpeg")):
+        try:
+            with Image.open(img_path) as img:
+                img.verify()  # Verify image integrity
+        except Exception as e:
+            print(f"Corrupt image detected: {img_path}. Attempting to restore...")
+            try:
+                with Image.open(img_path) as img:
+                    img = img.convert("RGB")  # Convert to a safe format
+                    restored_path = os.path.splitext(img_path)[0] + ".jpg"  # Save as JPG
+                    img.save(restored_path, "JPEG")
+                    if restored_path != img_path:
+                        os.remove(img_path)
+                print(f"Restored: {restored_path}")
+            except Exception as restore_error:
+                corrupted_dir = os.path.join(dataset_root, "corrupted")
+                os.makedirs(corrupted_dir, exist_ok=True)
+                print(f"Failed to restore {img_path}: {restore_error}")
+                shutil.move(img_path, os.path.join(corrupted_dir, os.path.basename(img_path)))
+                label_path = os.path.join(labels_dir, os.path.splitext(os.path.basename(img_path))[0] + ".txt")
+                if os.path.exists(label_path):
+                    shutil.move(label_path, os.path.join(corrupted_dir, os.path.basename(label_path)))
+
+# Verify duplicate images and labels
+def check_duplicates(directory, extensions):
+    file_list = []
+    for ext in extensions:
+        file_list.extend([os.path.splitext(os.path.basename(f))[0] for f in glob(os.path.join(directory, f"*.{ext}"))])
+    seen = set()
+    duplicates = set()
+    
+    for file in file_list:
+        if file in seen:
+            duplicates.add(file)
+        else:
+            seen.add(file)
+    
+    for duplicate in duplicates:
+        duplicate_files = [f for f in glob(os.path.join(directory, "*")) if os.path.splitext(os.path.basename(f))[0] == duplicate]
+        if len(duplicate_files) > 1:
+            print(f"Duplicate found: {duplicate}. Keeping one and deleting others...")
+            for file in duplicate_files[1:]:  # Keep the first, delete the rest
+                os.remove(file)
+
+# Verify missing labels
+def verify_missing_labels():
+    missing_labels = []
+    image_files = sorted(glob(os.path.join(images_dir, "*.jpg")) + glob(os.path.join(images_dir, "*.png")) + glob(os.path.join(images_dir, "*.jpeg")))
+    for img_path in image_files:
+        img_name = os.path.basename(img_path)
+        label_name = os.path.splitext(img_name)[0] + ".txt"
+        label_path = os.path.join(labels_dir, label_name)
+        if not os.path.exists(label_path):
+            missing_labels.append(img_name)
+            img_no_label_dir = os.path.join(dataset_root, "img_no_label")
+            os.makedirs(img_no_label_dir, exist_ok=True)
+            shutil.move(img_path, os.path.join(img_no_label_dir, img_name))
+
+    if missing_labels:
+        print(f"WARNING: {len(missing_labels)} images are missing labels! Moved to {img_no_label_dir}.")
+        with open(os.path.join(dataset_root, "missing_labels.log"), "w") as f:
+            f.write("\n".join(missing_labels))
+
+# Verify extra label without images
+def verify_extra_labels():
+    label_files = sorted(glob(os.path.join(labels_dir, "*.txt")))
+    extra_labels = []
+    for label_path in label_files:
+        label_name = os.path.splitext(os.path.basename(label_path))[0]
+        img_path = os.path.join(images_dir, label_name + ".jpg")
+        img_path_png = os.path.join(images_dir, label_name + ".png")
+        img_path_jpeg = os.path.join(images_dir, label_name + ".jpeg")
+        if not (os.path.exists(img_path) or os.path.exists(img_path_png) or os.path.exists(img_path_jpeg)):
+            extra_labels.append(label_path)
+            label_no_img_dir = os.path.join(dataset_root, "label_no_img")
+            os.makedirs(label_no_img_dir, exist_ok=True)
+            shutil.move(label_path, os.path.join(label_no_img_dir, os.path.basename(label_path)))
+
+    if extra_labels:
+        print(f"WARNING: {len(extra_labels)} labels found without matching images! Moved to {label_no_img_dir}.")
+
 all_classes = {}
 
 for json_file in glob(os.path.join(json_folder, "*.json")):
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    print(f"\nProcessing JSON file: {json_file}...")
+    # print(f"\nProcessing JSON file: {json_file}...")
 
     for obj in data["objects"]:
         class_id = obj.get("classId")
@@ -118,6 +203,14 @@ if missing_bboxes:
 
 print(f"\nAll JSON files converted! Labels saved in `{labels_dir}`")
 
+print("Verifying dataset integrity in progress...")
+verify_and_restore_images(images_dir)
+check_duplicates(images_dir, ["jpg", "png", "jpeg"])
+check_duplicates(labels_dir, ["txt"])
+verify_missing_labels()
+verify_extra_labels()
+print("Dataset verification complete!")
+
 #Train/Test split
 train_ratio = 0.8
 
@@ -160,16 +253,19 @@ move_files(test_files, test_img_dir, test_label_dir)
 print(f"Train/Test split completed! {len(train_files)} train / {len(test_files)} test")
 
 # Verify dataset: Check if every image has a corresponding label
-print("\nVerifying dataset integrity...")
+print("\nRe-verifying dataset integrity...")
 
 for split in ["train", "test"]:
     img_folder = os.path.join(images_dir, split)
     label_folder = os.path.join(labels_dir, split)
 
     image_files = sorted(glob(os.path.join(img_folder, "*.jpg"))+glob(os.path.join(img_folder, "*.jpeg"))+glob(os.path.join(img_folder, "*.png")))
+    label_files = sorted(glob(os.path.join(label_folder, "*.txt")))
 
     missing_labels = []
+    extra_labels = []
 
+    # Check for missing labels
     for img_path in image_files:
         img_name = os.path.basename(img_path)
         label_name = os.path.splitext(img_name)[0] + ".txt"
@@ -180,13 +276,25 @@ for split in ["train", "test"]:
 
     if missing_labels:
         print(f"ERROR: {len(missing_labels)} images in {split} have no labels!")
-        print("Stopping script execution. Please fix the dataset.")
+        print("Stopping script execution. Fix Train/Test script.")
         sys.exit(1)  # Stop script immediately
 
     else:
         print(f"All images in {split} have corresponding labels!")
 
-print("Dataset verification complete!\n")
+    # Check for extra labels
+    for label_path in label_files:
+        label_name = os.path.splitext(os.path.basename(label_path))[0]
+        
+        if not any(os.path.join(img_folder, label_name + ext) in image_files for ext in [".jpg", ".png", ".jpeg"]):
+            extra_labels.append(label_path)
+
+    if extra_labels:
+        print(f"ERROR: {len(extra_labels)} labels in {split} have no corresponding images!")
+        print("Stopping script execution. Fix Train/Test script.")
+        sys.exit(1)
+
+print("Dataset re-verification complete!\n")
 
 # Create data.yaml file
 yaml_file = os.path.join(dataset_root, "data.yaml")
